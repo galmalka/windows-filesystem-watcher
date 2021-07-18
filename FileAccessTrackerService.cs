@@ -68,13 +68,16 @@ namespace FileAccessTracker
         {
             if (filterOutRegex.IsMatch(e.FullPath))
             {
-                //return;
+                return;
             }
+
+            var fullPath = e.FullPath.Replace(@"\\", @"\");
+            var fileInfo = new FileInfo(e.FullPath);
 
             long fileSize;
             try
             {
-                fileSize = new FileInfo(e.FullPath).Length;
+                fileSize = fileInfo.Length;
             }
             catch (FileNotFoundException)
             {
@@ -87,15 +90,21 @@ namespace FileAccessTracker
                 fileSize = -1;
             }
 
+            var fileNameHashed = GetStableHashCode(fileInfo.Name);
+            var fileExtension = Path.GetExtension(e.FullPath);
+            var fileDirectoryScrubbed = GetScrubbedFolderPath(fileInfo.Directory?.ToString() ?? string.Empty);
+
             _telemetryClient.TrackEvent("FileAccess", new Dictionary<string, string>
             {
-                {"ChangeType", e.ChangeType.ToString()},
-                {"FilePath", e.FullPath},
-                {"FileSize", fileSize.ToString()},
-                {"DriveType", driveInfo.DriveType.ToString() },
-                {"DeviceId", _deviceId }
+                {"changeType", e.ChangeType.ToString()},
+                {"fileDir", fileDirectoryScrubbed},
+                {"fileNameHashed", fileNameHashed.ToString()},
+                {"fileExtension", fileExtension},
+                {"fileSize", fileSize.ToString()},
+                {"driveType", driveInfo.DriveType.ToString() },
+                {"deviceId", _deviceId }
             });
-            var item = $"{DateTime.UtcNow}, {e.ChangeType}, {e.FullPath}, {fileSize}";
+            var item = $"{DateTime.UtcNow}, {e.ChangeType}, {fileDirectoryScrubbed}, {fileNameHashed}, {fileExtension}, {fileSize}";
             _logger.LogInformation(item);
         }
 
@@ -120,10 +129,42 @@ namespace FileAccessTracker
             return fileSystemWatcher;
         }
 
+        private static string GetScrubbedFolderPath(string folderPath)
+        {
+            if (!Regex.IsMatch(folderPath, @".:\\users\\.*", RegexOptions.IgnoreCase))
+            {
+                return folderPath;
+            }
+
+            var parts = folderPath.Split(@"\");
+            parts[2] = "<scrubbed-user>";
+            return string.Join(@"\", parts);
+        }
+
+        private static int GetStableHashCode(string str)
+        {
+            unchecked
+            {
+                int hash1 = 5381;
+                int hash2 = hash1;
+
+                for (int i = 0; i < str.Length && str[i] != '\0'; i += 2)
+                {
+                    hash1 = ((hash1 << 5) + hash1) ^ str[i];
+                    if (i == str.Length - 1 || str[i + 1] == '\0')
+                        break;
+                    hash2 = ((hash2 << 5) + hash2) ^ str[i + 1];
+                }
+
+                return hash1 + (hash2 * 1566083941);
+            }
+        }
+
         private readonly ILogger<FileAccessTrackerService> _logger;
         private static Regex filterOutRegex = new Regex(@"(c:\\windows\\.*)|(c:\\users\\[^\\]*\\appdata\\.*)|(c:\\programdata\\.*)|(c:\\program files \(x86\)\\.*)|(c:\\program files\\.*)", RegexOptions.IgnoreCase);
         private readonly IList<FileSystemWatcher> _fileSystemWatchers = new List<FileSystemWatcher>();
         private readonly TelemetryClient _telemetryClient;
-        private readonly string _deviceId = new DeviceIdBuilder().AddSystemUUID().ToString();
+        private const string BUILD_VERSION = "0.0.1"; // TODO: replace with real build version
+        private readonly string _deviceId = new DeviceIdBuilder().AddSystemUUID().AddBuildVersion(BUILD_VERSION).ToString();
     }
 }
