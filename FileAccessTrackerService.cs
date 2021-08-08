@@ -1,13 +1,19 @@
 ﻿using DeviceId;
 using Microsoft.ApplicationInsights;
+using Microsoft.ApplicationInsights.DataContracts;
 using Microsoft.ApplicationInsights.Extensibility;
+using Microsoft.Diagnostics.Tracing;
+using Microsoft.Diagnostics.Tracing.Parsers;
+using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
+using Microsoft.Diagnostics.Tracing.Session;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Reflection;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -18,10 +24,15 @@ namespace FileAccessTracker
         public FileAccessTrackerService(ILogger<FileAccessTrackerService> logger)
         {
             _logger = logger;
-            foreach (var drive in DriveInfo.GetDrives())
+
+            _traceEventSession = new TraceEventSession(KernelTraceEventParser.KernelSessionName, TraceEventSessionOptions.NoRestartOnCreate)
             {
-                _fileSystemWatchers.Add(CreateFileSystemWatcherForDrive(drive));
-            }
+                BufferSizeMB = 128,
+            };
+
+            _traceEventSession.EnableKernelProvider(KernelTraceEventParser.Keywords.DiskFileIO |
+                    KernelTraceEventParser.Keywords.FileIOInit);
+            RegisterCallbacks();
             
 
             var configuration = new TelemetryConfiguration
@@ -36,37 +47,39 @@ namespace FileAccessTracker
 
         public override async Task StartAsync(CancellationToken cancellationToken)
         {
-            await base.StartAsync(cancellationToken);
+            _etwProcessingTask = Task.Run(() => _traceEventSession.Source.Process());
+            _logger.LogCritical($"DeviceId: {_deviceId}");
 
-            foreach (var watcher in _fileSystemWatchers)
-            {
-                watcher.EnableRaisingEvents = true;
-            }
+            await base.StartAsync(cancellationToken);
         }
 
-        public override Task StopAsync(CancellationToken cancellationToken)
+        public override async Task StopAsync(CancellationToken cancellationToken)
         {
-            foreach (var watcher in _fileSystemWatchers)
-            {
-                watcher.Dispose();
-            }
+            _traceEventSession.Stop();
+            await _etwProcessingTask;
 
-            return base.StopAsync(cancellationToken);
+            await base.StopAsync(cancellationToken);
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            Task snapshotTask = Task.Run(CreateSnapshotIfNeeded, stoppingToken);
+            var snapshotTask = Task.Run(CreateSnapshotIfNeeded, stoppingToken).ContinueWith(task =>
+            {
+                if (task.IsFaulted)
+                {
+                    _logger.LogError(task.Exception, "Snapshot task has failed");
+                    _telemetryClient.TrackException(task.Exception);
+                }
+            });
 
             while (!stoppingToken.IsCancellationRequested)
             {
                 try {
-                    if (snapshotTask.IsFaulted)
+                    if (_eventQueue.TryTake(out var fileAccessTelemetry, Timeout.Infinite, stoppingToken))
                     {
-                        _logger.LogError(snapshotTask.Exception, "Snapshot task has failed");
-                        _telemetryClient.TrackException(snapshotTask.Exception);
+                        _logger.LogDebug(fileAccessTelemetry.ToString());
+                        SendTelemetryEvent("FileAccess", fileAccessTelemetry.ToDictionary());
                     }
-                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
                 }
                 catch (OperationCanceledException)
                 {
@@ -75,49 +88,36 @@ namespace FileAccessTracker
             }
         }
 
-        private void HandleFileEvent(object sender, FileSystemEventArgs e, DriveInfo driveInfo)
+        private void RegisterCallbacks()
         {
-            if (filterOutRegex.IsMatch(e.FullPath))
-            {
-                // return;
-            }
-
-            var telemetryFileInfo = new TelemetryFileInfo(e.FullPath);
-
-            _telemetryClient.TrackEvent("FileAccess", new Dictionary<string, string>
-            {
-                {"changeType", e.ChangeType.ToString()},
-                {"fileDir", telemetryFileInfo.FileDirectoryScrubbed},
-                {"fileNameHashed", telemetryFileInfo.FileNameHashed},
-                {"fileExtension", telemetryFileInfo.FileExtension},
-                {"fileSize", telemetryFileInfo.FileSize.ToString()},
-                {"driveType", driveInfo.DriveType.ToString()},
-                {"deviceId", _deviceId},
-                {"buildVersion", _build_version}
-            });
-            var item = $"Timestamp: {DateTime.UtcNow}, ChangeType: {e.ChangeType}, {telemetryFileInfo}, DriveType: {driveInfo.DriveType.ToString()}, DeviceId: {_deviceId}";
-            _logger.LogInformation(item);
+            _traceEventSession.Source.Kernel.FileIODelete += HandleFileETW;
+            _traceEventSession.Source.Kernel.FileIOFlush += HandleFileETW;
+            _traceEventSession.Source.Kernel.FileIORename += HandleFileETW;
         }
 
-        private FileSystemWatcher CreateFileSystemWatcherForDrive(DriveInfo driveInfo)
+        private void HandleFileETW(TraceEvent traceEvent)
         {
-            var fileSystemWatcher = new FileSystemWatcher(driveInfo.Name);
-            fileSystemWatcher.NotifyFilter = NotifyFilters.Attributes
-                                 | NotifyFilters.CreationTime
-                                 | NotifyFilters.DirectoryName
-                                 | NotifyFilters.FileName
-                                 | NotifyFilters.LastAccess
-                                 | NotifyFilters.LastWrite
-                                 | NotifyFilters.Security
-                                 | NotifyFilters.Size;
+            string? filePath = null;
+            switch (traceEvent)
+            {
+                case FileIOInfoTraceData fileIOInfoTraceData:
+                    filePath = fileIOInfoTraceData.FileName;
+                    break;
+                case FileIOCreateTraceData fileIOCreateTraceData:
+                    filePath = fileIOCreateTraceData.FileName;
+                    break;
+                case FileIOSimpleOpTraceData fileIOSimpleOpTraceData:
+                    filePath = fileIOSimpleOpTraceData.FileName;
+                    break;
+                case FileIOReadWriteTraceData fileIOReadWriteTraceData:
+                    filePath = fileIOReadWriteTraceData.FileName;
+                    break;
+            }
 
-            FileSystemEventHandler handleFileEventFunc = (object sender, FileSystemEventArgs e) => HandleFileEvent(sender, e, driveInfo);
-            fileSystemWatcher.Deleted += handleFileEventFunc;
-            fileSystemWatcher.Changed += handleFileEventFunc;
-            fileSystemWatcher.Created += handleFileEventFunc;
-            fileSystemWatcher.IncludeSubdirectories = true;
-           
-            return fileSystemWatcher;
+            if (!string.IsNullOrEmpty(filePath))
+            {
+                _eventQueue.Add(new FileAccessTelemetry(filePath, traceEvent.ProcessName, traceEvent.EventName, traceEvent.TimeStamp));
+            }
         }
 
         private void CreateSnapshotIfNeeded()
@@ -137,31 +137,41 @@ namespace FileAccessTracker
 
             foreach (var driveInfo in DriveInfo.GetDrives())
             {
-                foreach (var file in Directory.EnumerateFiles(@"C:\", "*.*", enumerationOptions))
+                foreach (var file in Directory.EnumerateFiles(driveInfo.Name, "*.*", enumerationOptions))
                 {
-                    var telemetryFileInfo = new TelemetryFileInfo(file);
-                    _telemetryClient.TrackEvent("Snapshot", new Dictionary<string, string>
-                        {
-                            {"snapshotTimestamp", timestamp.ToString()},
-                            {"fileDir", telemetryFileInfo.FileDirectoryScrubbed},
-                            {"fileNameHashed", telemetryFileInfo.FileNameHashed},
-                            {"fileExtension", telemetryFileInfo.FileExtension},
-                            {"fileSize", telemetryFileInfo.FileSize.ToString()},
-                            {"driveType", driveInfo.DriveType.ToString()},
-                            {"deviceId", _deviceId},
-                            {"buildVersion", _build_version}
-                        });
+                    var snapshotTelemetry = new FileInfoTelemetry(file).ToDictionary();
+                    snapshotTelemetry.Add("snapshotTimestamp", timestamp.ToString());
+                    SendTelemetryEvent("Snapshot", snapshotTelemetry);
                 }
             }
 
             File.Create(snapshotFile).Dispose();
         }
 
+        private void SendTelemetryEvent(string eventName, IDictionary<string, string> telemetryData)
+        {
+            var eventTelemetry = new EventTelemetry(eventName);
+            telemetryData.ToList().ForEach(kvp => eventTelemetry.Properties.Add(kvp));
+            eventTelemetry.Context.User.Id = _deviceId;
+            eventTelemetry.Context.Component.Version = _build_version;
+            RemovePII(eventTelemetry);
+            _telemetryClient.TrackEvent(eventTelemetry);
+        }
+
+        private EventTelemetry RemovePII(EventTelemetry eventTelemetry)
+        {
+            eventTelemetry.Context.Cloud.RoleInstance = "<scrubbed>";
+            eventTelemetry.Context.Cloud.RoleName = "<scrubbed>";
+            eventTelemetry.Context.Location.Ip = "0.0.0.0";
+            return eventTelemetry;
+        }
+
         private readonly ILogger<FileAccessTrackerService> _logger;
-        private static Regex filterOutRegex = new Regex(@"(c:\\windows\\.*)|(c:\\users\\[^\\]*\\appdata\\.*)|(c:\\programdata\\.*)|(c:\\program files \(x86\)\\.*)|(c:\\program files\\.*)", RegexOptions.IgnoreCase);
-        private readonly IList<FileSystemWatcher> _fileSystemWatchers = new List<FileSystemWatcher>();
         private readonly TelemetryClient _telemetryClient;
         private readonly string _localServiceFolderPath;
+        private readonly BlockingCollection<FileAccessTelemetry> _eventQueue = new BlockingCollection<FileAccessTelemetry>();
+        private readonly TraceEventSession _traceEventSession;
+        private Task _etwProcessingTask;
         private static readonly string _build_version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "no-build-version";
         private static readonly string _deviceId = new DeviceIdBuilder().AddSystemUUID().AddBuildVersion(_build_version).ToString();
     }
