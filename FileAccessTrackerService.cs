@@ -33,13 +33,8 @@ namespace FileAccessTracker
             _traceEventSession.EnableKernelProvider(KernelTraceEventParser.Keywords.DiskFileIO |
                     KernelTraceEventParser.Keywords.FileIOInit);
             RegisterCallbacks();
-            
 
-            var configuration = new TelemetryConfiguration
-            {
-                ConnectionString = "InstrumentationKey=21a9798a-d074-4683-ba7b-d9b2d9ecf2c7;IngestionEndpoint=https://francecentral-1.in.applicationinsights.azure.com/"
-            };
-            _telemetryClient = new TelemetryClient(configuration);
+            _telemetryClient = CreateAndSetupTelemetryClient();
 
             _localServiceFolderPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FileAccessTrackerService");
             Directory.CreateDirectory(_localServiceFolderPath);
@@ -57,13 +52,14 @@ namespace FileAccessTracker
         {
             _traceEventSession.Stop();
             await _etwProcessingTask;
+            await _snapshotTask;
 
             await base.StopAsync(cancellationToken);
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            var snapshotTask = Task.Run(CreateSnapshotIfNeeded, stoppingToken).ContinueWith(task =>
+            _snapshotTask = Task.Run(() => CreateSnapshotIfNeeded(stoppingToken), stoppingToken).ContinueWith(task =>
             {
                 if (task.IsFaulted)
                 {
@@ -72,11 +68,19 @@ namespace FileAccessTracker
                 }
             });
 
+            var lastMetricReport = DateTime.UtcNow;
+
             while (!stoppingToken.IsCancellationRequested)
             {
                 try {
                     if (_eventQueue.TryTake(out var fileAccessTelemetry, Timeout.Infinite, stoppingToken))
                     {
+                        if (DateTime.UtcNow >= lastMetricReport.AddSeconds(60))
+                        {
+                            _telemetryClient.TrackMetric("EventsLost", _traceEventSession.EventsLost);
+                            lastMetricReport = DateTime.UtcNow;
+                        }
+
                         _logger.LogDebug(fileAccessTelemetry.ToString());
                         SendTelemetryEvent("FileAccess", fileAccessTelemetry.ToDictionary());
                     }
@@ -93,6 +97,9 @@ namespace FileAccessTracker
             _traceEventSession.Source.Kernel.FileIODelete += HandleFileETW;
             _traceEventSession.Source.Kernel.FileIOFlush += HandleFileETW;
             _traceEventSession.Source.Kernel.FileIORename += HandleFileETW;
+            _traceEventSession.Source.Kernel.FileIORead += HandleFileETW;
+            _traceEventSession.Source.Kernel.FileIOWrite += HandleFileETW;
+            _traceEventSession.Source.Kernel.FileIOFileCreate += HandleFileETW;
         }
 
         private void HandleFileETW(TraceEvent traceEvent)
@@ -120,7 +127,7 @@ namespace FileAccessTracker
             }
         }
 
-        private void CreateSnapshotIfNeeded()
+        private void CreateSnapshotIfNeeded(CancellationToken cancellationToken)
         {
             var snapshotFile = Path.Combine(_localServiceFolderPath, $"snapshot-{_build_version}");
             if (File.Exists(snapshotFile))
@@ -139,6 +146,11 @@ namespace FileAccessTracker
             {
                 foreach (var file in Directory.EnumerateFiles(driveInfo.Name, "*.*", enumerationOptions))
                 {
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        return;
+                    }
+
                     var snapshotTelemetry = new FileInfoTelemetry(file).ToDictionary();
                     snapshotTelemetry.Add("snapshotTimestamp", timestamp.ToString());
                     SendTelemetryEvent("Snapshot", snapshotTelemetry);
@@ -152,18 +164,23 @@ namespace FileAccessTracker
         {
             var eventTelemetry = new EventTelemetry(eventName);
             telemetryData.ToList().ForEach(kvp => eventTelemetry.Properties.Add(kvp));
-            eventTelemetry.Context.User.Id = _deviceId;
-            eventTelemetry.Context.Component.Version = _build_version;
-            RemovePII(eventTelemetry);
             _telemetryClient.TrackEvent(eventTelemetry);
         }
 
-        private EventTelemetry RemovePII(EventTelemetry eventTelemetry)
+        private TelemetryClient CreateAndSetupTelemetryClient()
         {
-            eventTelemetry.Context.Cloud.RoleInstance = "<scrubbed>";
-            eventTelemetry.Context.Cloud.RoleName = "<scrubbed>";
-            eventTelemetry.Context.Location.Ip = "0.0.0.0";
-            return eventTelemetry;
+            var configuration = new TelemetryConfiguration
+            {
+                ConnectionString = "InstrumentationKey=21a9798a-d074-4683-ba7b-d9b2d9ecf2c7;IngestionEndpoint=https://francecentral-1.in.applicationinsights.azure.com/"
+            };
+            var telemetryClient = new TelemetryClient(configuration);
+            telemetryClient.Context.User.Id = _deviceId;
+            telemetryClient.Context.Component.Version = _build_version;
+            telemetryClient.Context.Cloud.RoleInstance = "<scrubbed>";
+            telemetryClient.Context.Cloud.RoleName = "<scrubbed>";
+            telemetryClient.Context.Location.Ip = "0.0.0.0";
+
+            return telemetryClient;
         }
 
         private readonly ILogger<FileAccessTrackerService> _logger;
@@ -171,6 +188,7 @@ namespace FileAccessTracker
         private readonly string _localServiceFolderPath;
         private readonly BlockingCollection<FileAccessTelemetry> _eventQueue = new BlockingCollection<FileAccessTelemetry>();
         private readonly TraceEventSession _traceEventSession;
+        private Task _snapshotTask;
         private Task _etwProcessingTask;
         private static readonly string _build_version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "no-build-version";
         private static readonly string _deviceId = new DeviceIdBuilder().AddSystemUUID().AddBuildVersion(_build_version).ToString();
