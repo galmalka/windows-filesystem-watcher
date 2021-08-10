@@ -89,17 +89,33 @@ namespace FileAccessTracker
                 {
                     break;
                 }
+                catch (Exception ex)
+                {
+                    _telemetryClient.TrackException(ex);
+                }
             }
         }
 
         private void RegisterCallbacks()
         {
-            _traceEventSession.Source.Kernel.FileIODelete += HandleFileETW;
-            _traceEventSession.Source.Kernel.FileIOFlush += HandleFileETW;
-            _traceEventSession.Source.Kernel.FileIORename += HandleFileETW;
-            _traceEventSession.Source.Kernel.FileIORead += HandleFileETW;
-            _traceEventSession.Source.Kernel.FileIOWrite += HandleFileETW;
-            _traceEventSession.Source.Kernel.FileIOFileCreate += HandleFileETW;
+            Action<TraceEvent> handleFileETWFunc = traceEvent =>
+            {
+                try
+                {
+                    HandleFileETW(traceEvent);
+                }
+                catch (Exception ex)
+                {
+                    _telemetryClient.TrackException(ex);
+                }
+            };
+
+            _traceEventSession.Source.Kernel.FileIODelete += handleFileETWFunc;
+            _traceEventSession.Source.Kernel.FileIOFlush += handleFileETWFunc;
+            _traceEventSession.Source.Kernel.FileIORename += handleFileETWFunc;
+            _traceEventSession.Source.Kernel.FileIORead += handleFileETWFunc;
+            _traceEventSession.Source.Kernel.FileIOWrite += handleFileETWFunc;
+            _traceEventSession.Source.Kernel.FileIOFileCreate += handleFileETWFunc;
         }
 
         private void HandleFileETW(TraceEvent traceEvent)

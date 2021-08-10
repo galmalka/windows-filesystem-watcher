@@ -37,7 +37,16 @@ namespace FileAccessTracker
             _hashedName = new Lazy<string>(() => GetSHA256Hash(FileInfo?.Name?? Path.GetFileName(filePath)).ToString());
             FileExtension = Path.GetExtension(filePath);
             _scrubbedDirectoryName = new Lazy<string>(() => GetScrubbedFolderPath(FileInfo?.Directory?.ToString() ?? string.Empty));
-            _driveInfo = new Lazy<DriveInfo>(() => new DriveInfo(Path.GetPathRoot(filePath)));
+            _driveType = new Lazy<DriveType>(() => {
+                try
+                {
+                    return new DriveInfo(Path.GetPathRoot(filePath)).DriveType;
+                }
+                catch (Exception)
+                {
+                    return DriveType.Unknown;
+                }
+            });
         }
 
         public string FileNameHashed => _hashedName.Value;
@@ -48,7 +57,7 @@ namespace FileAccessTracker
 
         public long FileSize => _length.Value;
 
-        public DriveType DriveType => _driveInfo.Value.DriveType;
+        public DriveType DriveType => _driveType.Value;
 
         public override string ToString()
         {
@@ -94,6 +103,6 @@ namespace FileAccessTracker
         private readonly Lazy<long> _length;
         private readonly Lazy<string> _hashedName;
         private readonly Lazy<string> _scrubbedDirectoryName;
-        private readonly Lazy<DriveInfo> _driveInfo;
+        private readonly Lazy<DriveType> _driveType;
     }
 }
